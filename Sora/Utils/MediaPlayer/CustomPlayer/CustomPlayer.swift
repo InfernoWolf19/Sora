@@ -18,6 +18,29 @@ class SliderViewModel: ObservableObject {
     @Published var sliderValue: Double = 0.0
 }
 
+struct AniListMediaResponse: Decodable {
+  struct DataField: Decodable {
+    struct Media: Decodable { let idMal: Int? }
+    let Media: Media?
+  }
+  let data: DataField
+}
+
+struct AniSkipResponse: Decodable {
+  struct Result: Decodable {
+    struct Interval: Decodable {
+      let startTime: Double
+      let endTime:   Double
+    }
+    let interval: Interval
+    let skipType: String
+  }
+  let found:      Bool
+  let results:    [Result]
+  let statusCode: Int
+}
+
+
 // MARK: - CustomMediaPlayerViewController
 
 class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDelegate {
@@ -122,9 +145,38 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         }
     }
     
+    private var malID: Int?
+    private var skipIntervals: (op: CMTimeRange?, ed: CMTimeRange?) = (nil, nil)
+    
+    private var skipIntroButton: UIButton!
+    private var skipOutroButton: UIButton!
+    
     private var playerItemKVOContext = 0
     private var loadedTimeRangesObservation: NSKeyValueObservation?
     private var playerTimeControlStatusObserver: NSKeyValueObservation?
+    
+    private var isDimmed = false
+    private var dimButton: UIButton!
+    private var dimButtonToSlider: NSLayoutConstraint!
+    private var dimButtonToRight: NSLayoutConstraint!
+    private var dimButtonTimer: Timer?
+
+    private lazy var controlsToHide: [UIView] = [
+        dismissButton,
+        playPauseButton,
+        backwardButton,
+        forwardButton,
+        sliderHostingController!.view,
+        skip85Button,
+        marqueeLabel,
+        menuButton,
+        qualityButton,
+        speedButton,
+        watchNextButton,
+        volumeSliderHostingView!
+    ]
+
+    private var originalHiddenStates: [UIView: Bool] = [:]
     
     private var volumeObserver: NSKeyValueObservation?
     private var audioSession = AVAudioSession.sharedInstance()
@@ -185,6 +237,17 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         super.viewDidLoad()
         view.backgroundColor = .black
         
+        AniListMutation().fetchMalID(animeId: aniListID) { [weak self] result in
+            switch result {
+            case .success(let mal):
+                self?.malID = mal
+                self?.fetchSkipTimes(type: "op")
+                self?.fetchSkipTimes(type: "ed")
+            case .failure(let error):
+                print("⚠️ Unable to fetch MAL ID:", error)
+            }
+        }
+        
         setupHoldGesture()
         loadSubtitleSettings()
         setupPlayerViewController()
@@ -195,15 +258,18 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         setupSubtitleLabel()
         setupDismissButton()
         volumeSlider()
+        setupDimButton()
         setupSpeedButton()
         setupQualityButton()
         setupMenuButton()
         setupMarqueeLabel()
         setupSkip85Button()
+        setupSkipButtons()
         addTimeObserver()
         startUpdateTimer()
         setupAudioSession()
         
+        controlsToHide.forEach { originalHiddenStates[$0] = $0.isHidden }
         
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
             self?.checkForHLSStream()
@@ -784,6 +850,89 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         ])
     }
     
+    private func fetchSkipTimes(type: String) {
+        guard let mal = malID else { return }
+        let url = URL(string: "https://api.aniskip.com/v2/skip-times/\(mal)/\(episodeNumber)?types=\(type)&episodeLength=0")!
+        URLSession.shared.dataTask(with: url) { data, _, _ in
+            guard let d = data,
+                  let resp = try? JSONDecoder().decode(AniSkipResponse.self, from: d),
+                  resp.found,
+                  let interval = resp.results.first?.interval else { return }
+
+            let range = CMTimeRange(
+              start: CMTime(seconds: interval.startTime, preferredTimescale: 600),
+              end:   CMTime(seconds: interval.endTime,   preferredTimescale: 600)
+            )
+            DispatchQueue.main.async {
+              if type == "op" {
+                self.skipIntervals.op = range
+                print("→ OP interval:", range)
+              } else {
+                self.skipIntervals.ed = range
+                print("→ ED interval:", range)
+              }
+            }
+        }.resume()
+    }
+    
+    private func setupSkipButtons() {
+        skipIntroButton = UIButton(type: .system)
+        skipIntroButton.setTitle("Skip Intro", for: .normal)
+        skipIntroButton.addTarget(self, action: #selector(skipIntro), for: .touchUpInside)
+        skipIntroButton.isHidden = true
+        view.addSubview(skipIntroButton)
+        skipIntroButton.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            skipIntroButton.leadingAnchor.constraint(equalTo: skip85Button.trailingAnchor, constant: 12),
+            skipIntroButton.centerYAnchor.constraint(equalTo: skip85Button.centerYAnchor),
+        ])
+        view.bringSubviewToFront(skipIntroButton)
+
+        skipOutroButton = UIButton(type: .system)
+        skipOutroButton.setTitle("Skip Outro", for: .normal)
+        skipOutroButton.addTarget(self, action: #selector(skipOutro), for: .touchUpInside)
+        skipOutroButton.isHidden = true
+        view.addSubview(skipOutroButton)
+        skipOutroButton.translatesAutoresizingMaskIntoConstraints = false
+        NSLayoutConstraint.activate([
+            skipOutroButton.leadingAnchor.constraint(equalTo: skipIntroButton.trailingAnchor, constant: 12),
+            skipOutroButton.centerYAnchor.constraint(equalTo: skip85Button.centerYAnchor),
+        ])
+        view.bringSubviewToFront(skipOutroButton)
+    }
+    
+    private func setupDimButton() {
+        let cfg = UIImage.SymbolConfiguration(pointSize: 24, weight: .regular)
+        dimButton = UIButton(type: .system)
+        dimButton.setImage(UIImage(systemName: "moon.fill", withConfiguration: cfg), for: .normal)
+        dimButton.tintColor = .white
+        dimButton.addTarget(self, action: #selector(dimTapped), for: .touchUpInside)
+        controlsContainerView.addSubview(dimButton)
+        dimButton.translatesAutoresizingMaskIntoConstraints = false
+        
+        dimButton.layer.shadowColor = UIColor.black.cgColor
+        dimButton.layer.shadowOffset = CGSize(width: 0, height: 2)
+        dimButton.layer.shadowOpacity = 0.6
+        dimButton.layer.shadowRadius = 4
+        dimButton.layer.masksToBounds = false
+
+        NSLayoutConstraint.activate([
+          dimButton.centerYAnchor.constraint(equalTo: dismissButton.centerYAnchor),
+          dimButton.widthAnchor.constraint(equalToConstant: 24),
+          dimButton.heightAnchor.constraint(equalToConstant: 24),
+        ])
+
+        dimButtonToSlider = dimButton.trailingAnchor.constraint(
+          equalTo: volumeSliderHostingView!.leadingAnchor,
+          constant: -8
+        )
+        dimButtonToRight = dimButton.trailingAnchor.constraint(
+          equalTo: controlsContainerView.trailingAnchor,
+          constant: -16
+        )
+
+        dimButtonToSlider.isActive = true
+    }
     
     func updateMarqueeConstraints() {
         UIView.performWithoutAnimation {
@@ -1041,6 +1190,18 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
                 self.topSubtitleLabel.isHidden = true
             }
             
+            let current = self.currentTimeVal
+
+            if let op = self.skipIntervals.op {
+              let show = current >= op.start.seconds && current <= op.end.seconds
+              self.skipIntroButton.isHidden = !show
+            }
+
+            if let ed = self.skipIntervals.ed {
+              let show = current >= ed.start.seconds && current <= ed.end.seconds
+              self.skipOutroButton.isHidden = !show
+            }
+            
             DispatchQueue.main.async {
                 if let currentItem = self.player.currentItem, currentItem.duration.seconds > 0 {
                     let progress = min(max(self.currentTimeVal / self.duration, 0), 1.0)
@@ -1098,6 +1259,21 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         }
     }
     
+    @objc private func skipIntro() {
+      if let range = skipIntervals.op {
+        player.seek(to: range.end)
+        // optionally hide button immediately:
+        skipIntroButton.isHidden = true
+      }
+    }
+
+    @objc private func skipOutro() {
+      if let range = skipIntervals.ed {
+        player.seek(to: range.end)
+        skipOutroButton.isHidden = true
+      }
+    }
+    
     
     func startUpdateTimer() {
         updateTimer = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
@@ -1126,12 +1302,24 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
     }
     
     @objc func toggleControls() {
-        isControlsVisible.toggle()
-        UIView.animate(withDuration: 0.2, delay: 0, options: .curveEaseInOut, animations: {
-            let alphaVal: CGFloat = self.isControlsVisible ? 1 : 0
-            self.controlsContainerView.alpha = alphaVal
-            self.skip85Button.alpha = alphaVal
-        })
+        if isDimmed {
+            dimButton.isHidden = false
+            dimButton.alpha = 1.0
+            dimButtonTimer?.invalidate()
+            dimButtonTimer = Timer.scheduledTimer(withTimeInterval: 3.0, repeats: false) { [weak self] _ in
+                guard let self = self else { return }
+                UIView.animate(withDuration: 0.3, delay: 0, options: [.curveEaseInOut]) {
+                    self.dimButton.alpha = 0
+                }
+            }
+        } else {
+            isControlsVisible.toggle()
+            UIView.animate(withDuration: 0.2) {
+                let a: CGFloat = self.isControlsVisible ? 1 : 0
+                self.controlsContainerView.alpha = a
+                self.skip85Button.alpha = a
+            }
+        }
     }
     
     @objc func seekBackwardLongPress(_ gesture: UILongPressGestureRecognizer) {
@@ -1198,19 +1386,16 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
             isPlaying = false
             playPauseButton.image = UIImage(systemName: "play.fill")
             
-            // Defer the UI animation so that it doesn't block the pause call
             DispatchQueue.main.async {
                 if !self.isControlsVisible {
                     self.isControlsVisible = true
                     UIView.animate(withDuration: 0.1, animations: {
                         self.controlsContainerView.alpha = 1.0
                         self.skip85Button.alpha = 0.8
-                        // Removed layoutIfNeeded() to avoid forcing a layout pass here
                     })
                 }
             }
         } else {
-            // Play immediately
             player.play()
             isPlaying = true
             playPauseButton.image = UIImage(systemName: "pause.fill")
@@ -1239,6 +1424,30 @@ class CustomMediaPlayerViewController: UIViewController, UIGestureRecognizerDele
         if gesture.state == .began {
             togglePlayPause()
         }
+    }
+    
+    @objc private func dimTapped() {
+        isDimmed.toggle()
+        dimButtonTimer?.invalidate()
+
+        // animate black overlay
+        UIView.animate(withDuration: 0.25) {
+          self.blackCoverView.alpha = self.isDimmed ? 1.0 : 0.4
+        }
+
+        // fade controls instead of hiding
+        UIView.animate(withDuration: 0.25) {
+          for view in self.controlsToHide {
+            view.alpha = self.isDimmed ? 0 : 1
+          }
+          // keep the dim button visible/in front
+          self.dimButton.alpha = self.isDimmed ? 0 : 1
+        }
+
+        // swap your trailing constraints on the dim‑button
+        dimButtonToSlider.isActive = !isDimmed
+        dimButtonToRight.isActive  = isDimmed
+        UIView.animate(withDuration: 0.25) { self.view.layoutIfNeeded() }
     }
     
     func speedChangerMenu() -> UIMenu {
